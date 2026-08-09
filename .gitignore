@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Perfis e dados de alvo — NUNCA versionar
+.krb-profiles/
+profiles/
+*.orig
+krb5.conf
+hosts
+state.json
+faketime.sh
+
+# SO / editor
+.DS_Store
+*.swp
