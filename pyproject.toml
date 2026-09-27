@@ -26,14 +26,14 @@ classifiers = [
 ]
 
 [project.scripts]
-krb-handler = "KRB_Handler:main"
+krb-handler = "krb_handler.cli:main"
 
 [project.urls]
 Repository = "https://github.com/Okymi-X/KRB_Handler"
 Changelog = "https://github.com/Okymi-X/KRB_Handler/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
-py-modules = ["KRB_Handler"]
+packages = ["krb_handler"]
 
 [tool.setuptools.dynamic]
-version = {attr = "KRB_Handler.VERSION"}
+version = {attr = "krb_handler.constants.VERSION"}

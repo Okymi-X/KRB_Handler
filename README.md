@@ -69,10 +69,11 @@ git pull --ff-only
 pipx reinstall krb-handler
 ```
 
-The script can also be run directly:
+Without installing, it can also be run from a source checkout:
 
 ```bash
-python3 KRB_Handler.py --help
+python3 -m krb_handler --help   # preferred
+python3 KRB_Handler.py --help   # backward-compatible launcher
 ```
 
 ## Quick start
@@ -242,11 +243,29 @@ generated Kerberos client policy and should not be the default.
 
 ## Development
 
+The code is organized as a small package so each concern can be read and changed
+in isolation:
+
+```text
+krb_handler/
+├── __main__.py    # python -m krb_handler
+├── cli.py         # argument parsing, commands, main()
+├── constants.py   # file locations, limits, validation patterns
+├── ui.py          # colored terminal output (NO_COLOR aware)
+├── utils.py       # process, identity, time, and validation helpers
+├── discovery.py   # credential-free SMB2 / LDAP / NTP probing
+├── paths.py       # storage locations and safe/atomic file access
+├── profiles.py    # profile model, validation, and on-disk storage
+├── render.py      # krb5.conf and /etc/hosts generation
+├── system.py      # writing and restoring managed system files
+└── clock.py       # KDC clock synchronization and NTP bookkeeping
+```
+
 Run the test suite and syntax check with the standard library:
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m py_compile KRB_Handler.py
+python3 -m compileall krb_handler
 ```
 
 ## Authorized use
