@@ -28,7 +28,7 @@ está errado.
 O `KRB_Handler` faz **só isso**, e faz rápido:
 
 ```bash
-sudo ./KRB_Handler.py set 10.10.11.42
+krb-handler set 10.10.11.42
 ```
 
 Ele sonda o alvo, descobre tudo sozinho e escreve os três lugares por você.
@@ -61,18 +61,34 @@ Não autentica nada — para no *challenge*. Se a 445 estiver fechada, cai para 
 rootDSE** anônimo (389), depois **NTP** (123) para o relógio e **DNS reverso** para o nome.
 Se nada responder, você passa na mão com `--realm` / `--dc`.
 
+## Instalação isolada com pipx
+
+```bash
+git clone https://github.com/Okymi-X/KRB_Handler.git
+cd KRB_Handler
+pipx install .
+pipx ensurepath
+krb-handler --version
+```
+
+O `pipx` cria um ambiente virtual exclusivo e publica somente o comando
+`krb-handler` em `~/.local/bin`, sem alterar o Python do sistema. Para reinstalar uma
+versão modificada no mesmo checkout, use `pipx reinstall krb-handler`.
+
 ## Uso
 
 ```bash
-sudo ./KRB_Handler.py set 10.10.11.42        # detecta e aplica tudo (o comando principal)
-sudo ./KRB_Handler.py add 192.168.56.11      # soma um domínio filho / trust ao mesmo perfil
-sudo ./KRB_Handler.py use htb                # troca de ambiente num comando
-     ./KRB_Handler.py list                   # perfis salvos (marca o ativo)
-     ./KRB_Handler.py status                 # realm ativo, DCs, hosts e skew agora
-     ./KRB_Handler.py check                  # diagnóstico: portas 88/445/389/464, DNS, skew
-sudo ./KRB_Handler.py clock 10.10.11.42      # só o relógio
-sudo ./KRB_Handler.py restore                # devolve krb5.conf, /etc/hosts e NTP ao original
+krb-handler set 10.10.11.42        # detecta e aplica tudo (o comando principal)
+krb-handler add 192.168.56.11      # soma um domínio filho / trust ao mesmo perfil
+krb-handler use htb                # troca de ambiente num comando
+krb-handler list                   # perfis salvos (marca o ativo)
+krb-handler status                 # realm ativo, DCs, hosts e skew agora
+krb-handler check                  # diagnóstico: portas 88/445/389/464, DNS, skew
+krb-handler clock 10.10.11.42      # só o relógio
+krb-handler restore                # devolve krb5.conf, /etc/hosts e NTP ao original
 ```
+
+Os comandos que alteram arquivos do sistema ou o relógio pedem `sudo` automaticamente.
 
 Opções de `set` / `add`:
 
@@ -88,9 +104,9 @@ Opções de `set` / `add`:
 ### Exemplo — lab de 3 domínios
 
 ```bash
-sudo ./KRB_Handler.py set 192.168.56.10 --profile hogwarts   # floresta raiz
-sudo ./KRB_Handler.py add 192.168.56.11                      # domínio filho
-sudo ./KRB_Handler.py add 192.168.56.12                      # floresta com trust
+krb-handler set 192.168.56.10 --profile hogwarts   # floresta raiz
+krb-handler add 192.168.56.11                      # domínio filho
+krb-handler add 192.168.56.12                      # floresta com trust
 ```
 
 Os três realms convivem no mesmo `krb5.conf`, cada host apontando para o **seu** KDC.
@@ -106,7 +122,8 @@ minado de realms mortos.
 ## Segurança do seu ambiente
 
 - **Backup automático** do `/etc/krb5.conf` e do `/etc/hosts` originais na primeira
-  execução, em `~/.krb-profiles/backup/`. `restore` devolve tudo.
+  execução, em `/var/lib/krb-handler/backup/`, protegido pelo root. `restore` devolve
+  tudo. Backups de versões antigas em `~/.krb-profiles/backup/` não são confiados.
 - **`/etc/hosts` cirúrgico** — só o bloco entre `# >>> KRB_Handler` e `# <<< KRB_Handler`
   é tocado; o resto do arquivo fica intacto.
 - **Relógio** — antes de ajustar, desliga o NTP automático (senão ele desfaz o ajuste em
@@ -114,6 +131,8 @@ minado de realms mortos.
   relógio da máquina, `--faketime` gera um wrapper e o relógio real não muda.
 - **Auto-eleva com `sudo`** só nos comandos que escrevem. `list`, `status`, `show` e
   `check` rodam como usuário comum.
+- **Perfis validados** — nomes, realms, KDCs, IPs, FQDNs e aliases são validados antes
+  de qualquer conteúdo chegar ao `krb5.conf` ou ao `/etc/hosts`.
 
 ## Requisitos
 
@@ -124,11 +143,13 @@ minado de realms mortos.
 ## Estrutura
 
 ```
-KRB_Handler.py    a ferramenta (Python 3, stdlib, auto-sudo)
-caramelo.jpeg     logo da equipe
+KRB_Handler.py                 módulo principal (Python 3, stdlib, auto-sudo)
+pyproject.toml                 pacote e comando `krb-handler`
+caramelo.jpeg                  logo da equipe
 ~/.krb-profiles/                (criado em runtime; NÃO versionado)
   ├── active                    nome do perfil ativo
-  ├── profiles/<nome>.json      realms, KDCs e hosts do ambiente
+  └── profiles/<nome>.json      realms, KDCs e hosts do ambiente
+/var/lib/krb-handler/           estado privilegiado, pertencente ao root
   ├── backup/                   krb5.conf.orig e hosts.orig
   └── state.json                o que foi alterado no sistema (p/ o restore)
 ```

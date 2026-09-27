@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "krb-handler"
+version = "0.1.0"
+description = "Kerberos environment profile manager for authorized Active Directory assessments"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{name = "Rafael Raugi (Avocado) - Caramelo Storm"}]
+dependencies = []
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Security",
+]
+
+[project.scripts]
+krb-handler = "KRB_Handler:main"
+
+[project.urls]
+Repository = "https://github.com/Okymi-X/KRB_Handler"
+
+[tool.setuptools]
+py-modules = ["KRB_Handler"]

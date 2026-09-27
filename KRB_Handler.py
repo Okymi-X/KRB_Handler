@@ -1,54 +1,58 @@
 #!/usr/bin/env python3
 """
-KRB_Handler - configurador de ambiente Kerberos (KDC) para pentest de AD.
+KRB_Handler - Kerberos/KDC environment profile manager for AD pentesting.
 
-Aponta a sua Kali para o dominio alvo em UM comando: descobre o realm, o FQDN do
-DC e o relogio do KDC sondando o alvo (SMB2/NTLM anonimo, sem credencial), e entao
-escreve /etc/krb5.conf, ajusta /etc/hosts e sincroniza o relogio. Cada ambiente
-(HTB, OSCP, GOAD, cliente) vira um PERFIL salvo, entao trocar de alvo e um
-comando - sem reescrever arquivo na mao e sem quebrar o que ja estava ali.
+Point your machine at a target domain in one command: detect the realm, DC FQDN
+and KDC clock through unauthenticated SMB2/NTLM probing, then write
+/etc/krb5.conf, update /etc/hosts and sync the clock. Each environment
+(HTB, OSCP, GOAD, client labs) is saved as a profile, so switching targets does
+not require rewriting files by hand.
 
-Uso:
-  KRB_Handler.py                      # sem argumento: mostra esta ajuda
-  KRB_Handler.py set <alvo>           # DETECTA e APLICA tudo (o comando principal)
-  KRB_Handler.py add <alvo>           # soma outro dominio ao perfil (trust/filho)
-  KRB_Handler.py use <perfil>         # troca para um perfil salvo
-  KRB_Handler.py list                 # lista os perfis (marca o ativo)
-  KRB_Handler.py show [perfil]        # mostra o krb5.conf gerado
-  KRB_Handler.py status               # realm ativo, DCs, hosts, skew do relogio
-  KRB_Handler.py check [alvo]         # diagnostico (portas, DNS, skew, coerencia)
-  KRB_Handler.py clock <alvo>         # so o relogio (sincroniza com o KDC)
-  KRB_Handler.py hosts <ip> <fqdn>    # so o /etc/hosts
-  KRB_Handler.py del <perfil>         # remove um perfil salvo
-  KRB_Handler.py rename <a> <b>       # renomeia um perfil
-  KRB_Handler.py restore              # devolve krb5.conf, /etc/hosts e NTP ao original
+Usage:
+  krb-handler                      # no argument: show this help
+  krb-handler set <target>         # detect and apply everything
+  krb-handler add <target>         # add another domain to the active profile
+  krb-handler use <profile>        # switch to a saved profile
+  krb-handler list                 # list profiles and mark the active one
+  krb-handler show [profile]       # print the generated krb5.conf
+  krb-handler status               # active realm, DCs, hosts, clock skew
+  krb-handler check [target]       # diagnostics: ports, DNS, skew, consistency
+  krb-handler clock <target>       # only sync the clock with the KDC
+  krb-handler hosts <ip> <fqdn>    # only update /etc/hosts
+  krb-handler del <profile>        # delete a saved profile
+  krb-handler rename <a> <b>       # rename a profile
+  krb-handler restore              # restore krb5.conf, /etc/hosts and NTP
 
-Opcoes de 'set' / 'add':
-  --realm <REALM>    forca o realm (pula a deteccao)
-  --dc <fqdn>        forca o FQDN do DC
-  --profile <nome>   nome do perfil (default: o dominio detectado)
-  --desc "<texto>"   descricao do perfil
-  --no-clock         nao mexe no relogio
-  --no-hosts         nao mexe no /etc/hosts
-  --faketime         em vez de mudar o relogio, gera um wrapper faketime
-  --weak             habilita RC4/DES (labs e dominios antigos)
+Options for 'set' / 'add':
+  --realm <REALM>    force the realm and skip detection
+  --dc <fqdn>        force the DC FQDN
+  --profile <name>   profile name; default is the detected domain
+  --desc "<text>"    profile description
+  --no-clock         do not change the clock
+  --no-hosts         do not touch /etc/hosts
+  --faketime         create a faketime wrapper instead of changing the clock
+  --weak             enable RC4/DES for old domains and labs
 
-O script se auto-eleva com sudo nos comandos que escrevem (/etc/krb5.conf,
-/etc/hosts, relogio). Perfis ficam em ~/.krb-profiles/ do seu usuario.
-Somente biblioteca padrao - sem dependencias externas.
+The script auto-elevates with sudo for commands that write /etc/krb5.conf,
+/etc/hosts or the system clock. Profiles are stored in ~/.krb-profiles/.
+Standard library only, no external dependencies.
 
 Avocado / Caramelo Storm
 """
 
+import ipaddress
 import json
 import os
 import pwd
+import re
 import shutil
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -57,15 +61,20 @@ KRB5_CONF   = Path("/etc/krb5.conf")
 HOSTS_FILE  = Path("/etc/hosts")
 HOSTS_BEGIN = "# >>> KRB_Handler"
 HOSTS_END   = "# <<< KRB_Handler"
-SKEW_LIMIT  = 120                 # segundos: acima disso o Kerberos do AD recusa
-PROBE_TO    = 4                    # timeout de socket nas sondagens
+SKEW_LIMIT  = 120                 # AD Kerberos rejects tickets above this skew
+PROBE_TO    = 4                    # socket timeout for probes
+MAX_SMB_FRAME = 1024 * 1024        # probe responses should not need more than 1 MiB
+VERSION = "0.1.0"
 
-# cores
-R, B   = "\033[0m", "\033[1m"
-RED    = "\033[1;31m"
-GRN    = "\033[1;32m"
-YLW    = "\033[1;33m"
-CYN    = "\033[1;36m"
+PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+DNS_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
+
+# cores (respeita NO_COLOR e evita escapes em pipes/logs)
+if sys.stdout.isatty() and "NO_COLOR" not in os.environ:
+    R, B = "\033[0m", "\033[1m"
+    RED, GRN, YLW, CYN = "\033[1;31m", "\033[1;32m", "\033[1;33m", "\033[1;36m"
+else:
+    R = B = RED = GRN = YLW = CYN = ""
 
 
 def info(msg): print(f"{GRN}[*]{R} {msg}")
@@ -78,9 +87,12 @@ def ok(msg):   print(f"{GRN}[+]{R} {msg}")
 def out(cmd):
     """Roda e devolve stdout (str), engolindo erros."""
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        p = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=10, check=False,
+        )
         return p.stdout.strip()
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
         return ""
 
 
@@ -95,7 +107,7 @@ def filetime_to_epoch(ft):
 
 def fmt_skew(delta):
     s = abs(int(delta))
-    sign = "adiantada" if delta < 0 else "atrasada"
+    sign = "ahead" if delta < 0 else "behind"
     if s < 60:
         return f"{s}s ({sign})"
     return f"{s // 3600}h{(s % 3600) // 60:02d}m{s % 60:02d}s ({sign})"
@@ -103,31 +115,52 @@ def fmt_skew(delta):
 
 def is_ip(s):
     try:
-        socket.inet_aton(s)
-        return s.count(".") == 3
-    except OSError:
+        ipaddress.ip_address(s)
+        return True
+    except (ValueError, TypeError):
         return False
+
+
+def valid_dns_name(value, require_dot=False):
+    """Validate host/domain names without accepting control chars or injection."""
+    if not isinstance(value, str) or not value or len(value) > 253:
+        return False
+    value = value.rstrip(".")
+    if not value or (require_dot and "." not in value):
+        return False
+    labels = value.split(".")
+    return all(DNS_LABEL_RE.fullmatch(label) for label in labels)
+
+
+def valid_endpoint(value):
+    return is_ip(value) or valid_dns_name(value)
+
+
+def valid_description(value):
+    return (
+        isinstance(value, str)
+        and len(value) <= 512
+        and all(ord(char) >= 32 or char == "\t" for char in value)
+    )
 
 
 def looks_like_domain(s):
-    """Filtra lixo de DNS reverso (IP cru, nome sem ponto, rotulo so numerico)."""
-    if not s or "." not in s or is_ip(s):
+    """Filter noisy reverse-DNS values such as raw IPs and single labels."""
+    if not valid_dns_name(s, require_dot=True) or is_ip(s):
         return False
-    labels = s.split(".")
-    if any(not lb for lb in labels):
-        return False
+    labels = s.rstrip(".").split(".")
     return any(c.isalpha() for c in labels[-1])
 
 
 # ======================================================================
-#  SONDAGEM: descobre dominio, DC e relogio sem precisar de credencial
+#  PROBING: detect domain, DC and clock without credentials
 # ======================================================================
 #
-# Um unico handshake SMB2 (porta 445) entrega tudo o que o krb5.conf precisa:
-#   - NEGOTIATE responde com SystemTime  -> o relogio do KDC (skew)
-#   - SESSION_SETUP com NTLMSSP anonimo  -> o servidor devolve um CHALLENGE cujos
-#     AV_PAIRs trazem NetBIOS, FQDN do host, dominio DNS e a floresta.
-# Nao autentica nada: para no CHALLENGE (STATUS_MORE_PROCESSING_REQUIRED).
+# One SMB2 handshake on port 445 gives what krb5.conf needs:
+#   - NEGOTIATE returns SystemTime -> KDC clock skew
+#   - anonymous NTLMSSP SESSION_SETUP returns a CHALLENGE whose AV_PAIRs contain
+#     NetBIOS, host FQDN, DNS domain and forest.
+# Nothing is authenticated; the probe stops at STATUS_MORE_PROCESSING_REQUIRED.
 
 SMB2_HDR = b"\xfeSMB"
 NTLM_SIG = b"NTLMSSP\x00"
@@ -164,7 +197,10 @@ def _smb_recv(sock):
     head = _recv_exact(sock, 4)
     if not head:
         return b""
-    return _recv_exact(sock, struct.unpack(">I", head)[0] & 0x00FFFFFF)
+    size = struct.unpack(">I", head)[0] & 0x00FFFFFF
+    if size <= 0 or size > MAX_SMB_FRAME:
+        return b""
+    return _recv_exact(sock, size)
 
 
 def _recv_exact(sock, n):
@@ -178,7 +214,7 @@ def _recv_exact(sock, n):
 
 
 def _ntlm_negotiate():
-    """Mensagem NTLMSSP tipo 1 (crua, sem SPNEGO - o Windows aceita)."""
+    """Raw NTLMSSP type 1 message without SPNEGO; Windows accepts it."""
     flags = 0xA2088205  # UNICODE|REQUEST_TARGET|NTLM|ALWAYS_SIGN|EXT_SEC|VERSION|128|56
     return (
         NTLM_SIG
@@ -191,7 +227,7 @@ def _ntlm_negotiate():
 
 
 def _parse_av_pairs(blob):
-    """Extrai os AV_PAIRs do NTLMSSP CHALLENGE (tipo 2)."""
+    """Extract AV_PAIRs from an NTLMSSP CHALLENGE (type 2)."""
     start = blob.find(NTLM_SIG + struct.pack("<I", 2))
     if start < 0 or len(blob) < start + 48:
         return {}
@@ -200,6 +236,8 @@ def _parse_av_pairs(blob):
     found, i = {}, 0
     while i + 4 <= len(data):
         av_id, av_len = struct.unpack("<HH", data[i:i + 4])
+        if i + 4 + av_len > len(data):
+            break
         val = data[i + 4:i + 4 + av_len]
         if av_id == 0:
             break
@@ -212,7 +250,7 @@ def _parse_av_pairs(blob):
 
 
 def probe_smb(host, port=445):
-    """Devolve dict com dominio/DC/relogio, ou {} se o alvo nao responder SMB2."""
+    """Return domain/DC/clock data, or {} when the target does not answer SMB2."""
     res = {}
     try:
         sock = socket.create_connection((host, port), PROBE_TO)
@@ -220,7 +258,7 @@ def probe_smb(host, port=445):
         return res
     try:
         sock.settimeout(PROBE_TO)
-        # --- NEGOTIATE (dialetos 2.0.2 a 3.0.2; evita 3.1.1 p/ nao lidar com contexts)
+        # --- NEGOTIATE (dialects 2.0.2 through 3.0.2; avoids 3.1.1 contexts)
         dialects = [0x0202, 0x0210, 0x0300, 0x0302]
         body = (
             struct.pack("<HHHH", 36, len(dialects), 1, 0)
@@ -233,10 +271,10 @@ def probe_smb(host, port=445):
         resp = _smb_recv(sock)
         if not resp.startswith(SMB2_HDR) or len(resp) < 112:
             return res
-        # SystemTime fica no offset 40 do corpo da resposta (64 = header)
+        # SystemTime is at offset 40 of the response body (64 = header)
         res["time"] = filetime_to_epoch(struct.unpack("<Q", resp[104:112])[0])
 
-        # --- SESSION_SETUP com NTLMSSP tipo 1 (anonimo, para no challenge)
+        # --- SESSION_SETUP with anonymous NTLMSSP type 1, stopping at the challenge
         token = _ntlm_negotiate()
         body = (
             struct.pack("<HBB", 25, 0, 1)     # StructureSize, Flags, SecurityMode
@@ -270,22 +308,29 @@ def probe_smb(host, port=445):
 
 
 def _ber_len(data, i):
-    """Le um comprimento BER (curto ou longo). Devolve (valor, novo_indice)."""
+    """Read a short or long BER length. Return (value, new_index)."""
+    if i >= len(data):
+        raise ValueError("missing BER length")
     n = data[i]
     i += 1
     if n & 0x80:
         cnt = n & 0x7F
+        if cnt == 0 or cnt > 4 or i + cnt > len(data):
+            raise ValueError("invalid BER length")
         n = int.from_bytes(data[i:i + cnt], "big")
         i += cnt
     return n, i
 
 
 def _ber_children(data):
-    """Itera os TLVs de um buffer BER como pares (tag, valor)."""
+    """Iterate TLVs from a BER buffer as (tag, value) pairs."""
     i = 0
     while i + 1 < len(data):
         tag = data[i]
-        ln, i = _ber_len(data, i + 1)
+        try:
+            ln, i = _ber_len(data, i + 1)
+        except ValueError:
+            return
         if i + ln > len(data):
             return
         yield tag, data[i:i + ln]
@@ -293,10 +338,10 @@ def _ber_children(data):
 
 
 def _parse_rootdse(data):
-    """Extrai {atributo: valor} de um SearchResultEntry LDAP.
+    """Extract {attribute: value} from an LDAP SearchResultEntry.
 
-    Decodifica o BER de verdade: varrer strings imprimiveis parece funcionar
-    ate um byte de enquadramento cair na faixa ASCII e colar lixo no nome.
+    Decode BER properly: scanning printable strings looks fine until a framing
+    byte lands in the ASCII range and appends garbage to the name.
     """
     attrs = {}
     for tag, msg in _ber_children(data):              # LDAPMessage
@@ -355,7 +400,7 @@ def probe_ldap(host, port=389):
             if not chunk:
                 break
             data += chunk
-            if _parse_rootdse(data):      # ja deu para ler a entrada
+            if _parse_rootdse(data):      # enough data to parse the entry
                 break
     except OSError:
         pass
@@ -376,14 +421,13 @@ def probe_ldap(host, port=389):
 
 
 def probe_ntp(host):
-    """Relogio via NTP (UDP 123). Fallback de skew quando SMB nao responde."""
+    """Clock through NTP (UDP 123), used as skew fallback when SMB does not answer."""
     pkt = b"\x1b" + 47 * b"\0"
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(PROBE_TO)
-        sock.sendto(pkt, (host, 123))
-        data, _ = sock.recvfrom(96)
-        sock.close()
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(PROBE_TO)
+            sock.sendto(pkt, (host, 123))
+            data, _ = sock.recvfrom(96)
     except OSError:
         return None
     if len(data) < 48:
@@ -393,7 +437,7 @@ def probe_ntp(host):
 
 
 def probe(host, want_time=True):
-    """Sondagem completa com fallbacks. Devolve dict (pode vir incompleto)."""
+    """Full probe with fallbacks. Returns a possibly incomplete dict."""
     ip = host
     if not is_ip(host):
         try:
@@ -431,6 +475,69 @@ def probe(host, want_time=True):
 #  PERFIS
 # ======================================================================
 BASE = PROF_DIR = ACTIVE_F = BACKUP_DIR = STATE_F = None
+SYSTEM_BASE = Path("/var/lib/krb-handler")
+
+
+@contextmanager
+def real_user_access():
+    """Access profile files as the user that invoked sudo."""
+    if os.geteuid() != 0:
+        yield
+        return
+    try:
+        account = pwd.getpwnam(real_user())
+    except KeyError:
+        raise RuntimeError("real user not found") from None
+    if account.pw_uid == 0:
+        yield
+        return
+
+    old_groups = os.getgroups()
+    old_egid = os.getegid()
+    try:
+        os.setgroups(os.getgrouplist(account.pw_name, account.pw_gid))
+        os.setegid(account.pw_gid)
+        os.seteuid(account.pw_uid)
+        yield
+    finally:
+        os.seteuid(0)
+        os.setegid(old_egid)
+        os.setgroups(old_groups)
+
+
+def atomic_write(path, content, mode=0o600, owner_back=False):
+    """Grava dados de estado de forma atomica no mesmo filesystem."""
+    access = real_user_access() if owner_back else nullcontext()
+    with access:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            tmp.chmod(mode)
+            os.replace(tmp, path)
+        finally:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def ensure_system_storage():
+    """Create privileged state outside user-writable directories."""
+    if os.geteuid() != 0:
+        return
+    for path, mode in ((SYSTEM_BASE, 0o755), (BACKUP_DIR, 0o700)):
+        if path.exists():
+            st = path.lstat()
+            if path.is_symlink() or not path.is_dir() or st.st_uid != 0:
+                raise RuntimeError(f"insecure storage: {path} must be a root-owned directory")
+        else:
+            path.mkdir(parents=True, mode=mode)
+        path.chmod(mode)
 
 
 def init_paths():
@@ -443,63 +550,169 @@ def init_paths():
     BASE       = home / ".krb-profiles"
     PROF_DIR   = BASE / "profiles"
     ACTIVE_F   = BASE / "active"
-    BACKUP_DIR = BASE / "backup"
-    STATE_F    = BASE / "state.json"
-    PROF_DIR.mkdir(parents=True, exist_ok=True)
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    chown_back(BASE, PROF_DIR, BACKUP_DIR)
-
-
-def chown_back(*paths):
-    """Devolve a posse ao usuario real (criamos os arquivos como root)."""
-    try:
-        pw = pwd.getpwnam(real_user())
-    except KeyError:
-        return
-    for p in paths:
-        try:
-            os.chown(p, pw.pw_uid, pw.pw_gid)
-        except (OSError, PermissionError):
-            pass
+    BACKUP_DIR = SYSTEM_BASE / "backup"
+    STATE_F    = SYSTEM_BASE / "state.json"
+    with real_user_access():
+        PROF_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_system_storage()
 
 
 def valid_name(name):
-    return bool(name) and "/" not in name and not name.startswith(".")
+    return isinstance(name, str) and bool(PROFILE_NAME_RE.fullmatch(name))
 
 
 def profile_path(name):
+    if not valid_name(name):
+        raise ValueError(f"invalid profile name: {name!r}")
     return PROF_DIR / f"{name}.json"
 
 
 def list_profiles():
-    return sorted(p.stem for p in PROF_DIR.glob("*.json"))
+    with real_user_access():
+        return sorted(p.stem for p in PROF_DIR.glob("*.json") if valid_name(p.stem))
 
 
 def active_profile():
-    if ACTIVE_F.exists():
-        return ACTIVE_F.read_text().strip() or None
+    try:
+        with real_user_access():
+            if ACTIVE_F.exists():
+                name = ACTIVE_F.read_text(encoding="utf-8").strip()
+                return name if valid_name(name) else None
+    except OSError:
+        pass
     return None
 
 
 def set_active(name):
-    ACTIVE_F.write_text(name + "\n")
-    chown_back(ACTIVE_F)
+    if not valid_name(name):
+        raise ValueError(f"invalid profile name: {name!r}")
+    atomic_write(ACTIVE_F, name + "\n", owner_back=True)
+
+
+def validate_profile(prof):
+    """Valida e normaliza um perfil antes de usa-lo em contexto root."""
+    if not isinstance(prof, dict):
+        raise ValueError("profile must be a JSON object")
+    name = prof.get("name")
+    if not valid_name(name):
+        raise ValueError("invalid profile name")
+    description = prof.get("description", "")
+    if not valid_description(description):
+        raise ValueError("description contains invalid characters or is too long")
+
+    raw_realms = prof.get("realms")
+    if not isinstance(raw_realms, dict) or len(raw_realms) > 64:
+        raise ValueError("invalid realm list")
+    realms = {}
+    for raw_realm, raw_entry in raw_realms.items():
+        if not valid_dns_name(raw_realm) or not isinstance(raw_entry, dict):
+            raise ValueError(f"invalid realm: {raw_realm!r}")
+        realm = raw_realm.rstrip(".").upper()
+        if realm in realms:
+            raise ValueError(f"duplicate realm: {realm}")
+        raw_kdcs = raw_entry.get("kdc", [])
+        if not isinstance(raw_kdcs, list) or not raw_kdcs or len(raw_kdcs) > 64:
+            raise ValueError(f"invalid KDC list in realm {realm}")
+        kdcs = []
+        for raw_kdc in raw_kdcs:
+            if not isinstance(raw_kdc, str) or not valid_endpoint(raw_kdc):
+                raise ValueError(f"invalid KDC in realm {realm}")
+            kdc = raw_kdc.rstrip(".").lower() if not is_ip(raw_kdc) else raw_kdc
+            if kdc not in kdcs:
+                kdcs.append(kdc)
+        raw_ip = raw_entry.get("ip", "")
+        if raw_ip and (not isinstance(raw_ip, str) or not valid_endpoint(raw_ip)):
+            raise ValueError(f"invalid endpoint in realm {realm}")
+        netbios = raw_entry.get("netbios", "")
+        if netbios and (not isinstance(netbios, str) or not DNS_LABEL_RE.fullmatch(netbios)):
+            raise ValueError(f"invalid NetBIOS name in realm {realm}")
+        forest = raw_entry.get("forest", "")
+        if forest and (not isinstance(forest, str) or not valid_dns_name(forest)):
+            raise ValueError(f"invalid forest in realm {realm}")
+        realms[realm] = {
+            "kdc": kdcs,
+            "ip": raw_ip.rstrip(".").lower() if raw_ip and not is_ip(raw_ip) else raw_ip,
+            "netbios": netbios.upper(),
+            "forest": forest.rstrip(".").lower(),
+        }
+
+    default_realm = prof.get("default_realm", "")
+    if default_realm:
+        if not isinstance(default_realm, str) or not valid_dns_name(default_realm):
+            raise ValueError("invalid default_realm")
+        default_realm = default_realm.rstrip(".").upper()
+        if default_realm not in realms:
+            raise ValueError("default_realm is not present in realms")
+
+    raw_hosts = prof.get("hosts", [])
+    if not isinstance(raw_hosts, list) or len(raw_hosts) > 256:
+        raise ValueError("invalid hosts list")
+    hosts = []
+    for raw_host in raw_hosts:
+        if not isinstance(raw_host, dict):
+            raise ValueError("invalid host entry")
+        ip = raw_host.get("ip")
+        fqdn = raw_host.get("fqdn")
+        aliases = raw_host.get("aliases", [])
+        if not isinstance(ip, str) or not is_ip(ip):
+            raise ValueError("invalid IP in hosts")
+        if not isinstance(fqdn, str) or not valid_dns_name(fqdn):
+            raise ValueError("invalid FQDN in hosts")
+        if not isinstance(aliases, list) or len(aliases) > 32:
+            raise ValueError("invalid aliases in hosts")
+        clean_aliases = []
+        for alias in aliases:
+            if not isinstance(alias, str) or not valid_dns_name(alias):
+                raise ValueError("invalid host alias")
+            alias = alias.rstrip(".").lower()
+            if alias not in clean_aliases:
+                clean_aliases.append(alias)
+        hosts.append({"ip": ip, "fqdn": fqdn.rstrip(".").lower(), "aliases": clean_aliases})
+
+    options = prof.get("options", {})
+    if not isinstance(options, dict) or not isinstance(options.get("weak_crypto", False), bool):
+        raise ValueError("invalid options")
+    created = prof.get("created", "")
+    if not isinstance(created, str) or len(created) > 64:
+        raise ValueError("invalid creation timestamp")
+    return {
+        "name": name,
+        "description": description,
+        "created": created,
+        "default_realm": default_realm,
+        "realms": realms,
+        "hosts": hosts,
+        "options": {"weak_crypto": options.get("weak_crypto", False)},
+    }
 
 
 def load_profile(name):
-    p = profile_path(name)
-    if not p.exists():
-        return None
     try:
-        return json.loads(p.read_text())
-    except (json.JSONDecodeError, OSError):
+        p = profile_path(name)
+        with real_user_access():
+            if not p.exists():
+                return None
+            content = p.read_text(encoding="utf-8")
+        return validate_profile(json.loads(content))
+    except (ValueError, json.JSONDecodeError, OSError):
         return None
+
+
+def unlink_user_file(path, missing_ok=False):
+    with real_user_access():
+        path.unlink(missing_ok=missing_ok)
+
+
+def user_file_exists(path):
+    with real_user_access():
+        return path.exists()
 
 
 def save_profile(prof):
-    p = profile_path(prof["name"])
-    p.write_text(json.dumps(prof, indent=2) + "\n")
-    chown_back(p)
+    clean = validate_profile(prof)
+    p = profile_path(clean["name"])
+    atomic_write(p, json.dumps(clean, indent=2) + "\n", owner_back=True)
+    return clean
 
 
 def new_profile(name, desc=""):
@@ -515,10 +728,16 @@ def new_profile(name, desc=""):
 
 
 def merge_target(prof, data, make_default=True):
-    """Soma um alvo sondado ao perfil (idempotente)."""
+    """Add a probed target to the profile idempotently."""
+    if not valid_dns_name(data.get("realm", "")):
+        raise ValueError("invalid target realm")
+    if data.get("fqdn") and not valid_endpoint(data["fqdn"]):
+        raise ValueError("invalid target FQDN")
+    if data.get("ip") and not valid_endpoint(data["ip"]):
+        raise ValueError("invalid target IP/endpoint")
     realm = data["realm"]
     entry = prof["realms"].setdefault(realm, {"kdc": [], "ip": "", "netbios": "", "forest": ""})
-    # FQDN primeiro (casa com o SPN), IP depois como rede de seguranca.
+    # FQDN first because it matches the SPN; IP remains a fallback.
     if data.get("fqdn") and data["fqdn"] not in entry["kdc"]:
         entry["kdc"].insert(0, data["fqdn"])
     if data.get("ip") and data["ip"] not in entry["kdc"]:
@@ -527,7 +746,7 @@ def merge_target(prof, data, make_default=True):
     entry["netbios"] = data.get("netbios_domain", entry["netbios"])
     entry["forest"] = data.get("forest", entry["forest"])
 
-    if data.get("ip") and data.get("fqdn"):
+    if is_ip(data.get("ip")) and data.get("fqdn") and valid_dns_name(data["fqdn"]):
         aliases = [data["domain"]]
         short = data["fqdn"].split(".")[0]
         if short and short != data["domain"]:
@@ -544,10 +763,11 @@ def merge_target(prof, data, make_default=True):
 #  RENDER: krb5.conf e /etc/hosts
 # ======================================================================
 def render_krb5(prof):
+    prof = validate_profile(prof)
     o = prof.get("options", {})
     lines = [
-        "# Gerado por KRB_Handler (Avocado / Caramelo Storm) - nao edite na mao.",
-        f"# perfil: {prof['name']}   {datetime.now().isoformat(timespec='seconds')}",
+        "# Generated by KRB_Handler (Avocado / Caramelo Storm) - do not edit by hand.",
+        f"# profile: {prof['name']}   {datetime.now().isoformat(timespec='seconds')}",
         "",
         "[libdefaults]",
         f"    default_realm = {prof['default_realm']}",
@@ -585,9 +805,9 @@ def render_krb5(prof):
         dom = realm.lower()
         lines.append(f"    {dom} = {realm}")
         lines.append(f"    .{dom} = {realm}")
-    # Cada host vai para o realm de sufixo MAIS LONGO. Sem isso, num dominio
-    # filho o host casa tambem com o sufixo do pai e o cliente procura o KDC
-    # errado - o classico "KDC reply did not match expectations".
+    # Each host maps to the longest matching realm suffix. Without this, a child
+    # domain host may also match the parent suffix and the client will query the
+    # wrong KDC, causing "KDC reply did not match expectations".
     for h in prof["hosts"]:
         best = best_realm_for(h["fqdn"], prof["realms"])
         if best:
@@ -597,7 +817,7 @@ def render_krb5(prof):
 
 
 def best_realm_for(fqdn, realms):
-    """Realm cujo dominio e o sufixo mais especifico do FQDN."""
+    """Return the realm whose domain is the most specific FQDN suffix."""
     match = ""
     for realm in realms:
         dom = realm.lower()
@@ -608,7 +828,8 @@ def best_realm_for(fqdn, realms):
 
 
 def render_hosts_block(prof):
-    lines = [f"{HOSTS_BEGIN}: {prof['name']} (gerado; use KRB_Handler.py)"]
+    prof = validate_profile(prof)
+    lines = [f"{HOSTS_BEGIN}: {prof['name']} (generated; use krb-handler)"]
     for h in prof["hosts"]:
         names = " ".join([h["fqdn"], *h.get("aliases", [])])
         lines.append(f"{h['ip']}\t{names}")
@@ -617,23 +838,62 @@ def render_hosts_block(prof):
 
 
 def backup_once(path):
-    """Guarda uma copia do arquivo original (so na primeira vez)."""
+    """Save one copy of the original file."""
+    ensure_system_storage()
     dst = BACKUP_DIR / (path.name + ".orig")
     if not dst.exists() and path.exists():
         shutil.copy2(path, dst)
-        chown_back(dst)
-        info(f"Backup do original em {dst}")
+        dst.chmod(0o600)
+        info(f"Original backup saved to {dst}")
+
+
+def write_system_text(path, content, mode=0o644):
+    """Write a system file atomically with predictable permissions."""
+    if path.exists():
+        st = path.lstat()
+        if path.is_symlink() or not path.is_file() or st.st_uid != 0:
+            raise RuntimeError(f"insecure system file: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.chmod(mode)
+        if os.geteuid() == 0:
+            os.chown(tmp, 0, 0)
+        os.replace(tmp, path)
+        path.chmod(mode)
+        if os.geteuid() == 0:
+            os.chown(path, 0, 0)
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def write_krb5(prof):
+    prof = validate_profile(prof)
     backup_once(KRB5_CONF)
-    KRB5_CONF.write_text(render_krb5(prof))
-    ok(f"/etc/krb5.conf escrito  (default_realm = {CYN}{prof['default_realm']}{R})")
+    write_system_text(KRB5_CONF, render_krb5(prof), mode=0o644)
+    ok(f"/etc/krb5.conf written  (default_realm = {CYN}{prof['default_realm']}{R})")
 
 
 def write_hosts(prof):
+    prof = validate_profile(prof)
     backup_once(HOSTS_FILE)
-    current = HOSTS_FILE.read_text().splitlines(keepends=True) if HOSTS_FILE.exists() else []
+    current = HOSTS_FILE.read_text(encoding="utf-8").splitlines(keepends=True) if HOSTS_FILE.exists() else []
     kept, skipping = [], False
     for line in current:
         if line.startswith(HOSTS_BEGIN):
@@ -649,15 +909,15 @@ def write_hosts(prof):
     body = "".join(kept).rstrip("\n") + "\n"
     if prof["hosts"]:
         body += "\n" + render_hosts_block(prof)
-    HOSTS_FILE.write_text(body)
+    write_system_text(HOSTS_FILE, body, mode=0o644)
     if prof["hosts"]:
-        ok(f"/etc/hosts atualizado ({len(prof['hosts'])} entrada(s) do perfil)")
+        ok(f"/etc/hosts updated ({len(prof['hosts'])} profile entries)")
 
 
 def clear_hosts_block():
     if not HOSTS_FILE.exists():
         return
-    prof = {"name": "-", "hosts": []}
+    prof = new_profile("restore")
     write_hosts(prof)
 
 
@@ -667,15 +927,15 @@ def clear_hosts_block():
 def read_state():
     if STATE_F and STATE_F.exists():
         try:
-            return json.loads(STATE_F.read_text())
+            return json.loads(STATE_F.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             pass
     return {}
 
 
 def write_state(st):
-    STATE_F.write_text(json.dumps(st, indent=2) + "\n")
-    chown_back(STATE_F)
+    ensure_system_storage()
+    atomic_write(STATE_F, json.dumps(st, indent=2) + "\n", mode=0o644)
 
 
 def ntp_enabled():
@@ -683,47 +943,48 @@ def ntp_enabled():
 
 
 def sync_clock(target_epoch, host, faketime=False):
-    """Alinha o relogio local ao do KDC (ou gera um wrapper faketime)."""
+    """Align the local clock to the KDC or generate a faketime wrapper."""
     skew = target_epoch - time.time()
     if abs(skew) < 5:
-        ok(f"Relogio ja alinhado com {host} (delta {int(skew)}s)")
+        ok(f"Clock already aligned with {host} (delta {int(skew)}s)")
         return
-    print(f"    relogio local esta {YLW}{fmt_skew(skew)}{R} em relacao ao KDC")
+    print(f"    local clock is {YLW}{fmt_skew(skew)}{R} compared to the KDC")
 
     if faketime:
         if not shutil.which("faketime"):
-            err("faketime nao instalado:  sudo apt install faketime")
+            err("faketime is not installed")
             return
         offset = f"{'+' if skew >= 0 else '-'}{abs(int(skew))}s"
         script = BASE / "faketime.sh"
-        script.write_text(
+        atomic_write(
+            script,
             "#!/bin/sh\n"
-            f"# gerado por KRB_Handler para {host}\n"
-            f"exec faketime -f '{offset}' \"$@\"\n"
+            f"# generated by KRB_Handler for {host}\n"
+            f"exec faketime -f '{offset}' \"$@\"\n",
+            mode=0o700,
+            owner_back=True,
         )
-        script.chmod(0o755)
-        chown_back(script)
-        ok(f"Wrapper criado: {script}   (uso: {script} <sua-ferramenta> ...)")
+        ok(f"Wrapper created: {script}   (usage: {script} <your-tool> ...)")
         return
 
     if abs(skew) < SKEW_LIMIT:
-        info(f"Skew de {int(abs(skew))}s esta dentro do limite ({SKEW_LIMIT}s) - sincronizando mesmo assim")
+        info(f"{int(abs(skew))}s skew is within the limit ({SKEW_LIMIT}s) - syncing anyway")
 
     st = read_state()
     if ntp_enabled():
         st["ntp_was_on"] = True
         subprocess.run(["timedatectl", "set-ntp", "false"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        info("NTP automatico desligado (senao ele desfaz o ajuste)")
+        info("Automatic NTP disabled so it does not undo the adjustment")
     write_state(st)
 
     stamp = datetime.fromtimestamp(target_epoch, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     r = subprocess.run(["date", "-u", "-s", stamp],
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if r.returncode == 0:
-        ok(f"Relogio sincronizado com o KDC ({stamp} UTC)")
+        ok(f"Clock synced with the KDC ({stamp} UTC)")
     else:
-        err(f"Falha ao ajustar o relogio: {r.stderr.strip()}")
+        err(f"Failed to adjust the clock: {r.stderr.strip()}")
 
 
 def restore_clock():
@@ -731,7 +992,7 @@ def restore_clock():
     if st.pop("ntp_was_on", False):
         subprocess.run(["timedatectl", "set-ntp", "true"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        ok("NTP automatico religado (relogio volta sozinho ao horario real)")
+        ok("Automatic NTP re-enabled")
     write_state(st)
 
 
@@ -751,12 +1012,12 @@ def parse_args(argv):
             opts[a.lstrip("-")] = True
         elif a in FLAGS_VAL:
             if i + 1 >= len(argv):
-                err(f"{a} exige um valor")
+                err(f"{a} requires a value")
                 sys.exit(1)
             opts[a.lstrip("-")] = argv[i + 1]
             i += 1
         elif a.startswith("--"):
-            err(f"opcao desconhecida: {a}")
+            err(f"unknown option: {a}")
             sys.exit(1)
         else:
             pos.append(a)
@@ -768,16 +1029,27 @@ def parse_args(argv):
 #  COMANDOS
 # ======================================================================
 def resolve_target(target, opts):
-    """Sonda o alvo e monta o dict de dados, respeitando --realm/--dc."""
-    info(f"Sondando {CYN}{target}{R} ...")
+    """Probe the target and build the data dict, honoring --realm/--dc."""
+    if not valid_endpoint(target):
+        err(f"invalid target: {target!r}")
+        sys.exit(1)
+    info(f"Probing {CYN}{target}{R} ...")
     data = probe(target)
 
     forced = []
     if opts.get("realm"):
-        data["domain"] = opts["realm"].lower()
+        realm = opts["realm"].rstrip(".")
+        if not valid_dns_name(realm):
+            err(f"invalid realm: {opts['realm']!r}")
+            sys.exit(1)
+        data["domain"] = realm.lower()
         forced.append("--realm")
     if opts.get("dc"):
-        data["fqdn"] = opts["dc"].lower()
+        dc = opts["dc"].rstrip(".")
+        if not valid_endpoint(dc):
+            err(f"invalid DC: {opts['dc']!r}")
+            sys.exit(1)
+        data["fqdn"] = dc.lower()
         forced.append("--dc")
         if not data.get("domain") and data["fqdn"].count(".") >= 1:
             data["domain"] = data["fqdn"].split(".", 1)[1]
@@ -785,35 +1057,45 @@ def resolve_target(target, opts):
         detected = data.get("via")
         data["via"] = f"manual ({', '.join(forced)})" + (f" + {detected}" if detected else "")
 
-    if not data.get("domain"):
-        err("Nao consegui descobrir o dominio.")
-        warn("O alvo respondeu? Tente com os valores na mao:")
-        warn(f"  KRB_Handler.py set {target} --realm CORP.LOCAL --dc dc01.corp.local")
+    if not data.get("domain") or not valid_dns_name(data["domain"]):
+        err("Could not detect the domain.")
+        warn("Did the target answer? Try passing the values manually:")
+        warn(f"  krb-handler set {target} --realm CORP.LOCAL --dc dc01.corp.local")
         sys.exit(1)
 
+    data["domain"] = data["domain"].rstrip(".").lower()
     data["realm"] = data["domain"].upper()
+    if data.get("fqdn") and not valid_endpoint(data["fqdn"]):
+        warn("Detected FQDN was invalid - ignoring it")
+        data.pop("fqdn", None)
+    if data.get("forest") and not valid_dns_name(data["forest"]):
+        data.pop("forest", None)
+    for key in ("netbios_domain", "netbios_host"):
+        if data.get(key) and not DNS_LABEL_RE.fullmatch(data[key]):
+            data.pop(key, None)
     if not data.get("fqdn"):
-        warn("FQDN do DC nao detectado - usando o proprio alvo como KDC")
+        warn("DC FQDN was not detected - using the target itself as KDC")
         data["fqdn"] = data.get("ip", target)
 
-    print(f"    dominio  : {CYN}{data['domain']}{R}   (realm {data['realm']})")
+    print(f"    domain   : {CYN}{data['domain']}{R}   (realm {data['realm']})")
     print(f"    DC       : {data['fqdn']}  [{data.get('ip','?')}]")
     if data.get("netbios_domain"):
         print(f"    NetBIOS  : {data['netbios_domain']}\\{data.get('netbios_host','?')}")
     if data.get("forest") and data["forest"] != data["domain"]:
-        print(f"    floresta : {data['forest']}")
+        print(f"    forest   : {data['forest']}")
     print(f"    via      : {data.get('via', '?')}")
     return data
 
 
 def apply_profile(prof, opts, clock_host=None, clock_epoch=None):
+    prof = validate_profile(prof)
     write_krb5(prof)
     if not opts.get("no-hosts"):
         write_hosts(prof)
     if not opts.get("no-clock") and clock_epoch:
         sync_clock(clock_epoch, clock_host, faketime=bool(opts.get("faketime")))
     elif not opts.get("no-clock"):
-        warn("Relogio do KDC nao obtido - pulei o sync (rode: KRB_Handler.py clock <alvo>)")
+        warn("KDC clock was not obtained - skipped sync (run: krb-handler clock <target>)")
     save_profile(prof)
     set_active(prof["name"])
 
@@ -821,20 +1103,24 @@ def apply_profile(prof, opts, clock_host=None, clock_epoch=None):
 def cmd_set(argv, add=False):
     pos, opts = parse_args(argv)
     if not pos:
-        err(f"uso: KRB_Handler.py {'add' if add else 'set'} <ip-ou-fqdn-do-DC> [opcoes]")
+        err(f"usage: krb-handler {'add' if add else 'set'} <DC-ip-or-fqdn> [options]")
         sys.exit(1)
     data = resolve_target(pos[0], opts)
 
+    if opts.get("desc") is not None and not valid_description(opts["desc"]):
+        err("invalid description: use at most 512 characters without line breaks")
+        sys.exit(1)
+
     if add:
         name = opts.get("profile") or active_profile()
-        if not name:
-            err("Nenhum perfil ativo. Use 'set' primeiro ou passe --profile <nome>.")
+        if not name or not valid_name(name):
+            err("No active profile. Use 'set' first or pass --profile <name>.")
             sys.exit(1)
         prof = load_profile(name) or new_profile(name, opts.get("desc", ""))
     else:
         name = opts.get("profile") or data["domain"].split(".")[0]
         if not valid_name(name):
-            err(f"nome de perfil invalido: {name}")
+            err(f"invalid profile name: {name}")
             sys.exit(1)
         prof = load_profile(name) or new_profile(name, opts.get("desc", ""))
         if opts.get("desc"):
@@ -847,41 +1133,43 @@ def cmd_set(argv, add=False):
     print()
     apply_profile(prof, opts, data.get("fqdn"), data.get("time"))
     print()
-    ok(f"Perfil {CYN}{prof['name']}{R} ativo com {len(prof['realms'])} realm(s). "
-       f"Pode usar suas ferramentas com -k / Kerberos.")
+    ok(f"Profile {CYN}{prof['name']}{R} active with {len(prof['realms'])} realm(s). "
+       f"You can use your tools with -k / Kerberos.")
 
 
 def cmd_use(argv):
     pos, opts = parse_args(argv)
     if not pos:
-        err("uso: KRB_Handler.py use <perfil>")
+        err("usage: krb-handler use <profile>")
         sys.exit(1)
     prof = load_profile(pos[0])
     if not prof:
-        err(f"Perfil '{pos[0]}' nao existe. Veja:  KRB_Handler.py list")
+        err(f"Profile '{pos[0]}' does not exist. See:  krb-handler list")
         sys.exit(1)
-    apply_profile(prof, opts, None, None)
-    ok(f"Perfil {CYN}{prof['name']}{R} aplicado.")
+    apply_opts = dict(opts)
+    apply_opts["no-clock"] = True
+    apply_profile(prof, apply_opts, None, None)
+    ok(f"Profile {CYN}{prof['name']}{R} applied.")
     if not opts.get("no-clock"):
         first = next(iter(prof["realms"].values()), {})
         host = first.get("ip") or (first.get("kdc") or [None])[0]
         if host:
-            info(f"Checando o relogio contra {host} ...")
+            info(f"Checking the clock against {host} ...")
             data = probe(host)
             if data.get("time"):
                 sync_clock(data["time"], host, faketime=bool(opts.get("faketime")))
             else:
-                warn("KDC nao respondeu - relogio nao verificado")
+                warn("KDC did not answer - clock was not verified")
 
 
 def cmd_list(argv):
     act = active_profile()
     names = list_profiles()
     if not names:
-        info("Nenhum perfil ainda. Crie com:  KRB_Handler.py set <ip-do-DC>")
+        info("No profiles yet. Create one with:  krb-handler set <DC-ip>")
         return
-    print(f"\n{B}Perfis Kerberos{R}   (* = ativo)\n")
-    print(f"   {'NOME':<16}{'REALM PADRAO':<30}{'REALMS':>7}  DESCRICAO")
+    print(f"\n{B}Kerberos Profiles{R}   (* = active)\n")
+    print(f"   {'NAME':<16}{'DEFAULT REALM':<30}{'REALMS':>7}  DESCRIPTION")
     print(f"   {'-'*14:<16}{'-'*28:<30}{'-'*6:>7}  {'-'*18}")
     for n in names:
         p = load_profile(n) or {}
@@ -895,11 +1183,11 @@ def cmd_show(argv):
     pos, _ = parse_args(argv)
     name = pos[0] if pos else active_profile()
     if not name:
-        err("Nenhum perfil ativo. uso: KRB_Handler.py show <perfil>")
+        err("No active profile. usage: krb-handler show <profile>")
         sys.exit(1)
     prof = load_profile(name)
     if not prof:
-        err(f"Perfil '{name}' nao existe.")
+        err(f"Profile '{name}' does not exist.")
         sys.exit(1)
     print(render_krb5(prof))
     if prof["hosts"]:
@@ -908,25 +1196,25 @@ def cmd_show(argv):
 
 def cmd_status(argv):
     act = active_profile()
-    print(f"\n{B}Status Kerberos{R}")
-    print(f"  Perfil ativo : {CYN}{act}{R}" if act else f"  Perfil ativo : {YLW}(nenhum){R}")
+    print(f"\n{B}Kerberos Status{R}")
+    print(f"  Active profile: {CYN}{act}{R}" if act else f"  Active profile: {YLW}(none){R}")
 
-    realm, realms = "(nao definido)", []
+    realm, realms = "(not set)", []
     if KRB5_CONF.exists():
-        for line in KRB5_CONF.read_text().splitlines():
+        for line in KRB5_CONF.read_text(encoding="utf-8").splitlines():
             s = line.strip()
             if s.startswith("default_realm"):
                 realm = s.split("=", 1)[1].strip()
             elif "=" in s and s.endswith("{"):
                 realms.append(s.split("=")[0].strip())
-    print(f"  krb5.conf    : {KRB5_CONF} {'(existe)' if KRB5_CONF.exists() else RED + '(ausente)' + R}")
+    print(f"  krb5.conf    : {KRB5_CONF} {'(exists)' if KRB5_CONF.exists() else RED + '(missing)' + R}")
     print(f"  default_realm: {CYN}{realm}{R}")
     print(f"  realms       : {', '.join(realms) if realms else '-'}")
 
     managed = []
     if HOSTS_FILE.exists():
         inside = False
-        for line in HOSTS_FILE.read_text().splitlines():
+        for line in HOSTS_FILE.read_text(encoding="utf-8").splitlines():
             if line.startswith(HOSTS_BEGIN):
                 inside = True
                 continue
@@ -935,18 +1223,18 @@ def cmd_status(argv):
                 continue
             if inside and line.strip():
                 managed.append(line.strip())
-    print(f"  /etc/hosts   : {len(managed)} entrada(s) gerenciada(s)")
+    print(f"  /etc/hosts   : {len(managed)} managed entries")
     for m in managed:
         print(f"                 {m}")
 
     if ntp_enabled():
-        ntp_txt = "ligado"
+        ntp_txt = "enabled"
     elif read_state().get("ntp_was_on"):
-        ntp_txt = f"{YLW}desligado pelo KRB_Handler{R} ('restore' religa)"
+        ntp_txt = f"{YLW}disabled by KRB_Handler{R} ('restore' re-enables it)"
     else:
-        ntp_txt = "desligado (ja estava assim)"
-    print(f"  NTP auto     : {ntp_txt}")
-    print(f"  Hora local   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        ntp_txt = "disabled (already disabled)"
+    print(f"  Auto NTP     : {ntp_txt}")
+    print(f"  Local time   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
     prof = load_profile(act) if act else None
     if prof:
@@ -957,26 +1245,31 @@ def cmd_status(argv):
             if data.get("time"):
                 skew = data["time"] - time.time()
                 color = GRN if abs(skew) < SKEW_LIMIT else RED
-                print(f"  Skew vs KDC  : {color}{fmt_skew(skew)}{R}  (limite {SKEW_LIMIT}s)")
+                print(f"  Skew vs KDC  : {color}{fmt_skew(skew)}{R}  (limit {SKEW_LIMIT}s)")
             else:
-                print(f"  Skew vs KDC  : {YLW}KDC {host} nao respondeu{R}")
-    print(f"  Perfis em    : {BASE}\n")
+                print(f"  Skew vs KDC  : {YLW}KDC {host} did not answer{R}")
+    print(f"  Profiles in  : {BASE}\n")
 
 
 def cmd_check(argv):
     pos, _ = parse_args(argv)
+    if pos and not valid_endpoint(pos[0]):
+        err(f"invalid target: {pos[0]!r}")
+        sys.exit(1)
     prof = load_profile(active_profile()) if active_profile() else None
     targets = []
     if pos:
-        targets = [(None, pos[0])]           # alvo avulso: realm ainda desconhecido
+        targets = [(None, pos[0])]           # ad-hoc target; realm is not known yet
     elif prof:
         for realm, e in prof["realms"].items():
-            targets.append((realm, e.get("kdc", [e.get("ip")])[0]))
+            kdcs = e.get("kdc") or []
+            if kdcs:
+                targets.append((realm, kdcs[0]))
     if not targets:
-        err("Nada para checar. uso: KRB_Handler.py check <alvo>")
+        err("Nothing to check. usage: krb-handler check <target>")
         sys.exit(1)
 
-    print(f"\n{B}Diagnostico Kerberos{R}\n")
+    print(f"\n{B}Kerberos Diagnostics{R}\n")
     for realm, host in targets:
         print(f"  {CYN}{realm or host}{R}" + (f"  ->  {host}" if realm else ""))
         ip = host
@@ -985,8 +1278,8 @@ def cmd_check(argv):
                 ip = socket.gethostbyname(host)
                 print(f"    [{GRN}ok{R}]   DNS/hosts: {host} -> {ip}")
             except OSError:
-                print(f"    [{RED}x{R} ]   DNS/hosts: {host} NAO resolve  "
-                      f"-> falta entrada no /etc/hosts")
+                print(f"    [{RED}x{R} ]   DNS/hosts: {host} does not resolve  "
+                      f"-> missing /etc/hosts entry")
                 continue
         for port, label in ((88, "kerberos"), (445, "smb"), (389, "ldap"), (464, "kpasswd")):
             try:
@@ -995,19 +1288,19 @@ def cmd_check(argv):
                 print(f"    [{GRN}ok{R}]   {port}/tcp {label}")
             except OSError:
                 mark = RED + "x" + R if port == 88 else YLW + "!" + R
-                print(f"    [{mark} ]   {port}/tcp {label} fechado")
+                print(f"    [{mark} ]   {port}/tcp {label} closed")
         data = probe(ip)
         if data.get("time"):
             skew = data["time"] - time.time()
             good = abs(skew) < SKEW_LIMIT
             print(f"    [{GRN + 'ok' + R if good else RED + 'x ' + R}]   skew {fmt_skew(skew)}"
-                  f"{'' if good else '  -> KRB_AP_ERR_SKEW; rode: KRB_Handler.py clock ' + host}")
+                  f"{'' if good else '  -> KRB_AP_ERR_SKEW; run: krb-handler clock ' + host}")
         if data.get("domain"):
             if realm and data["domain"].upper() != realm.upper():
-                print(f"    [{YLW}!{R} ]   o host diz ser de {data['domain'].upper()}, "
-                      f"nao de {realm}  -> perfil desatualizado?")
+                print(f"    [{YLW}!{R} ]   host reports {data['domain'].upper()}, "
+                      f"not {realm}  -> outdated profile?")
             elif not realm:
-                print(f"    [{GRN}ok{R}]   realm do host: {data['domain'].upper()}"
+                print(f"    [{GRN}ok{R}]   host realm: {data['domain'].upper()}"
                       f"  ({data.get('fqdn','?')})")
     print()
 
@@ -1021,12 +1314,12 @@ def cmd_clock(argv):
             first = next(iter(prof["realms"].values()), {})
             host = first.get("ip") or (first.get("kdc") or [None])[0]
     if not host:
-        err("uso: KRB_Handler.py clock <alvo>")
+        err("usage: krb-handler clock <target>")
         sys.exit(1)
-    info(f"Lendo o relogio de {CYN}{host}{R} ...")
+    info(f"Reading clock from {CYN}{host}{R} ...")
     data = probe(host)
     if not data.get("time"):
-        err(f"{host} nao devolveu horario (SMB 445 / NTP 123 fechados?)")
+        err(f"{host} did not return a timestamp (SMB 445 / NTP 123 closed?)")
         sys.exit(1)
     sync_clock(data["time"], host, faketime=bool(opts.get("faketime")))
 
@@ -1034,11 +1327,20 @@ def cmd_clock(argv):
 def cmd_hosts(argv):
     pos, _ = parse_args(argv)
     if len(pos) < 2:
-        err("uso: KRB_Handler.py hosts <ip> <fqdn> [alias ...]")
+        err("usage: krb-handler hosts <ip> <fqdn> [alias ...]")
         sys.exit(1)
     name = active_profile() or "manual"
     prof = load_profile(name) or new_profile(name)
     ip, fqdn, aliases = pos[0], pos[1].lower(), [a.lower() for a in pos[2:]]
+    if not is_ip(ip):
+        err(f"invalid IP: {ip!r}")
+        sys.exit(1)
+    if not valid_dns_name(fqdn):
+        err(f"invalid FQDN: {fqdn!r}")
+        sys.exit(1)
+    if any(not valid_dns_name(alias) for alias in aliases):
+        err("invalid alias")
+        sys.exit(1)
     if not aliases and fqdn.count(".") >= 1:
         aliases = [fqdn.split(".")[0]]
     prof["hosts"] = [h for h in prof["hosts"] if h["fqdn"] != fqdn]
@@ -1051,36 +1353,39 @@ def cmd_hosts(argv):
 def cmd_del(argv):
     pos, _ = parse_args(argv)
     if not pos:
-        err("uso: KRB_Handler.py del <perfil>")
+        err("usage: krb-handler del <profile>")
         sys.exit(1)
     name = pos[0]
-    if not profile_path(name).exists():
-        err(f"Perfil '{name}' nao existe.")
+    if not valid_name(name):
+        err(f"invalid profile name: {name!r}")
         sys.exit(1)
-    profile_path(name).unlink()
+    if not user_file_exists(profile_path(name)):
+        err(f"Profile '{name}' does not exist.")
+        sys.exit(1)
+    unlink_user_file(profile_path(name))
     if active_profile() == name:
-        ACTIVE_F.unlink(missing_ok=True)
-        warn("Era o perfil ativo - /etc/krb5.conf continua como esta. "
-             "Use 'use <outro>' ou 'restore'.")
-    info(f"Perfil '{name}' removido.")
+        unlink_user_file(ACTIVE_F, missing_ok=True)
+        warn("It was the active profile - /etc/krb5.conf was left as-is. "
+             "Use 'use <other>' or 'restore'.")
+    info(f"Profile '{name}' deleted.")
 
 
 def cmd_rename(argv):
     pos, _ = parse_args(argv)
-    if len(pos) < 2 or not valid_name(pos[1]):
-        err("uso: KRB_Handler.py rename <antigo> <novo>")
+    if len(pos) < 2 or not valid_name(pos[0]) or not valid_name(pos[1]):
+        err("usage: krb-handler rename <old> <new>")
         sys.exit(1)
     old, new = pos
-    if not profile_path(old).exists():
-        err(f"Perfil '{old}' nao existe.")
+    if not user_file_exists(profile_path(old)):
+        err(f"Profile '{old}' does not exist.")
         sys.exit(1)
-    if profile_path(new).exists():
-        err(f"Perfil '{new}' ja existe.")
+    if user_file_exists(profile_path(new)):
+        err(f"Profile '{new}' already exists.")
         sys.exit(1)
     prof = load_profile(old)
     prof["name"] = new
     save_profile(prof)
-    profile_path(old).unlink()
+    unlink_user_file(profile_path(old))
     if active_profile() == old:
         set_active(new)
     info(f"'{old}' -> '{new}'")
@@ -1089,15 +1394,15 @@ def cmd_rename(argv):
 def cmd_restore(argv):
     orig = BACKUP_DIR / "krb5.conf.orig"
     if orig.exists():
-        shutil.copy2(orig, KRB5_CONF)
-        ok(f"/etc/krb5.conf restaurado do backup ({orig})")
+        write_system_text(KRB5_CONF, orig.read_text(encoding="utf-8"), mode=0o644)
+        ok(f"/etc/krb5.conf restored from backup ({orig})")
     else:
-        warn("Sem backup de krb5.conf - deixando como esta.")
+        warn("No krb5.conf backup found - leaving it as-is.")
     clear_hosts_block()
-    ok("/etc/hosts: bloco do KRB_Handler removido")
+    ok("/etc/hosts: KRB_Handler block removed")
     restore_clock()
-    ACTIVE_F.unlink(missing_ok=True)
-    info("Nenhum perfil ativo agora. Os perfis salvos continuam em disco.")
+    unlink_user_file(ACTIVE_F, missing_ok=True)
+    info("No active profile now. Saved profiles are still on disk.")
 
 
 def cmd_help(argv):
@@ -1120,7 +1425,7 @@ COMMANDS = {
     "help": cmd_help, "-h": cmd_help, "--help": cmd_help,
 }
 
-# Comandos que escrevem em /etc ou mexem no relogio precisam de root.
+# Commands that write to /etc or change the clock need root.
 NEEDS_ROOT = {"set", "target", "add", "use", "switch", "hosts",
               "clock", "time", "sync", "restore", "revert"}
 
@@ -1131,24 +1436,33 @@ def main():
     if not argv or argv[0] in ("help", "-h", "--help"):
         cmd_help([])
         return
+    if argv[0] in ("version", "--version"):
+        print(f"krb-handler {VERSION}")
+        return
 
     cmd = argv[0]
-    if cmd in NEEDS_ROOT and os.geteuid() != 0:
-        os.execvp("sudo", ["sudo", "-E", sys.executable, os.path.abspath(__file__), *argv])
-
-    init_paths()
-
     handler = COMMANDS.get(cmd)
     if not handler:
-        err(f"comando desconhecido: {cmd}\n")
+        err(f"unknown command: {cmd}\n")
         cmd_help([])
         sys.exit(1)
+    if cmd in NEEDS_ROOT and os.geteuid() != 0:
+        sudo = shutil.which("sudo")
+        if not sudo:
+            err("sudo not found; this command needs root")
+            sys.exit(1)
+        os.execv(sudo, [sudo, "--", sys.executable, os.path.abspath(__file__), *argv])
+
     try:
+        init_paths()
         handler(argv[1:])
     except KeyboardInterrupt:
         print()
-        warn("interrompido")
+        warn("interrupted")
         sys.exit(130)
+    except (OSError, RuntimeError, ValueError) as exc:
+        err(str(exc))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

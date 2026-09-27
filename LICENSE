@@ -21,7 +21,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 -------------------------------------------------------------------------------
-BH_Handler is an offensive-security support tool intended ONLY for authorized
-engagements. BloodHound and the Active Directory data it collects must be used
-within the scope of a written authorization. The authors assume no liability
-for misuse.
+KRB_Handler is an offensive-security support tool intended ONLY for authorized
+engagements. Kerberos and Active Directory environments must be used within the
+scope of a written authorization. The authors assume no liability for misuse.
